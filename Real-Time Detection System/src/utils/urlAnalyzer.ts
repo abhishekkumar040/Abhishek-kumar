@@ -38,6 +38,7 @@ const SUSPICIOUS_PATTERNS = {
   suspiciousTlds: /\.(tk|ml|ga|cf|gq|pw|top|xyz|work|click|link|loan|win|racing|review|stream)/i,
   numericDomain: /^[0-9.]+$/,
   phishingWords: /(free|winner|congratulation|urgent|limited|expire|suspend|unusual|activity|security-alert|verify-account|locked)/i,
+  punycode: /(^|\.)xn--/i,
 };
 
 const LEGITIMATE_DOMAINS = [
@@ -47,9 +48,55 @@ const LEGITIMATE_DOMAINS = [
   'stackoverflow.com', 'npmjs.com', 'vercel.com', 'cloudflare.com',
 ];
 
+// --- FIX #1: exact / true-subdomain match instead of substring match ---
+// The previous version used hostname.includes(d), which matched fake hosts like
+// "amazon.com.verify-login.tk" because the trusted string appears anywhere in
+// the hostname. This only matches the real domain or a genuine subdomain of it.
+function isDomainOrSubdomain(hostname: string, trustedDomain: string): boolean {
+  return hostname === trustedDomain || hostname.endsWith(`.${trustedDomain}`);
+}
+
+// --- FIX #2: typosquat detection ---
+// Flags hostnames that are suspiciously *close* (by edit distance) to a trusted
+// domain's registrable name without actually being it or a subdomain of it —
+// e.g. "arnazon.com", "paypa1.com", "gogle-support.com".
+function levenshtein(a: string, b: string): number {
+  const dp: number[][] = Array.from({ length: a.length + 1 }, () => new Array(b.length + 1).fill(0));
+  for (let i = 0; i <= a.length; i++) dp[i][0] = i;
+  for (let j = 0; j <= b.length; j++) dp[0][j] = j;
+  for (let i = 1; i <= a.length; i++) {
+    for (let j = 1; j <= b.length; j++) {
+      dp[i][j] = a[i - 1] === b[j - 1]
+        ? dp[i - 1][j - 1]
+        : 1 + Math.min(dp[i - 1][j - 1], dp[i - 1][j], dp[i][j - 1]);
+    }
+  }
+  return dp[a.length][b.length];
+}
+
+function findTyposquatTarget(hostname: string): string | null {
+  // Compare against the registrable "label" of each trusted domain (e.g. "amazon"
+  // from "amazon.com"), since attackers usually keep a similar TLD/structure and
+  // tweak the brand name itself.
+  const labels = hostname.split('.');
+  const candidateLabel = labels.length >= 2 ? labels[labels.length - 2] : hostname;
+
+  for (const trusted of LEGITIMATE_DOMAINS) {
+    if (isDomainOrSubdomain(hostname, trusted)) return null; // it's the real thing
+    const trustedLabel = trusted.split('.')[0];
+    if (candidateLabel === trustedLabel) continue; // identical label, different TLD is caught elsewhere
+    const distance = levenshtein(candidateLabel, trustedLabel);
+    // Small edit distance relative to the brand name length = likely typosquat
+    if (distance > 0 && distance <= 2 && trustedLabel.length >= 4) {
+      return trusted;
+    }
+  }
+  return null;
+}
+
 function extractFeatures(url: string): FeatureData[] {
   const features: FeatureData[] = [];
-  
+
   try {
     const urlObj = new URL(url.startsWith('http') ? url : `https://${url}`);
     const hostname = urlObj.hostname;
@@ -168,12 +215,24 @@ function extractFeatures(url: string): FeatureData[] {
       description: pathDepth > 5 ? 'Deep nesting may be used to confuse users' : 'Normal path structure'
     });
 
+    // Punycode / homograph domain (e.g. xn--...  used to spoof Unicode look-alikes)
+    const isPunycode = SUSPICIOUS_PATTERNS.punycode.test(hostname);
+    features.push({
+      name: 'Punycode/Homograph Domain',
+      category: 'url',
+      value: isPunycode ? 'Detected' : 'Not Found',
+      isSuspicious: isPunycode,
+      severity: isPunycode ? 'critical' : 'low',
+      description: isPunycode ? 'CRITICAL: Domain uses punycode encoding - often used to visually impersonate a trusted brand with look-alike characters' : 'No punycode encoding detected'
+    });
+
     // === DOMAIN-BASED FEATURES ===
 
     // Domain age simulation (based on known domains)
-    const isKnownLegitimate = LEGITIMATE_DOMAINS.some(d => hostname.includes(d));
+    // FIX: exact/subdomain match instead of substring match (see isDomainOrSubdomain)
+    const isKnownLegitimate = LEGITIMATE_DOMAINS.some(d => isDomainOrSubdomain(hostname, d));
     const hasSuspiciousTld = SUSPICIOUS_PATTERNS.suspiciousTlds.test(hostname);
-    
+
     features.push({
       name: 'Domain Reputation',
       category: 'domain',
@@ -181,6 +240,19 @@ function extractFeatures(url: string): FeatureData[] {
       isSuspicious: !isKnownLegitimate && hasSuspiciousTld,
       severity: !isKnownLegitimate && hasSuspiciousTld ? 'high' : 'low',
       description: isKnownLegitimate ? 'Recognized legitimate domain' : 'Domain reputation unknown - proceed with caution'
+    });
+
+    // Typosquat detection - flags look-alike domains impersonating a trusted brand
+    const typosquatTarget = isKnownLegitimate ? null : findTyposquatTarget(hostname);
+    features.push({
+      name: 'Typosquatting',
+      category: 'domain',
+      value: typosquatTarget ? `Resembles ${typosquatTarget}` : 'Not Detected',
+      isSuspicious: !!typosquatTarget,
+      severity: typosquatTarget ? 'critical' : 'low',
+      description: typosquatTarget
+        ? `CRITICAL: Domain closely resembles trusted domain "${typosquatTarget}" but is not it - likely impersonation`
+        : 'Domain does not closely resemble a known trusted domain'
     });
 
     // TLD Check
@@ -228,13 +300,17 @@ function extractFeatures(url: string): FeatureData[] {
     });
 
     // Simulated domain registration age
-    const simulatedAgeDays = isKnownLegitimate 
-      ? Math.floor(Math.random() * 3650) + 365 
+    // NOTE: this remains a client-side simulation (Math.random) since no real
+    // WHOIS/registration-date lookup is wired up. Treat this feature as
+    // illustrative only - see the accompanying notes on adding a real backend
+    // lookup (e.g. WHOIS API or a registration-date service).
+    const simulatedAgeDays = isKnownLegitimate
+      ? Math.floor(Math.random() * 3650) + 365
       : Math.floor(Math.random() * 180);
     features.push({
       name: 'Domain Age (Simulated)',
       category: 'domain',
-      value: simulatedAgeDays > 365 ? `${Math.floor(simulatedAgeDays/365)}+ years` : `${simulatedAgeDays} days`,
+      value: simulatedAgeDays > 365 ? `${Math.floor(simulatedAgeDays / 365)}+ years` : `${simulatedAgeDays} days`,
       isSuspicious: simulatedAgeDays < 30,
       severity: simulatedAgeDays < 7 ? 'critical' : simulatedAgeDays < 30 ? 'high' : simulatedAgeDays < 90 ? 'medium' : 'low',
       description: simulatedAgeDays < 30 ? `Domain registered only ${simulatedAgeDays} days ago - very suspicious!` : 'Established domain with history'
@@ -276,7 +352,9 @@ function extractFeatures(url: string): FeatureData[] {
     });
 
     // Form/credential request simulation
-    const requestsCredentials = hasLoginKeywords && (!isKnownLegitimate || hasPhishingWords);
+    // FIX: also treat typosquats as untrusted, since isKnownLegitimate alone
+    // is no longer inflated by the substring-match bug
+    const requestsCredentials = hasLoginKeywords && (!isKnownLegitimate || hasPhishingWords || !!typosquatTarget);
     features.push({
       name: 'Credential Request',
       category: 'content',
@@ -305,7 +383,9 @@ function calculatePhishProbability(features: FeatureData[]): { probability: numb
   let phishScore = 0;
   const weights: Record<string, number> = {
     'IP Address Usage': 25,
+    'Typosquatting': 24,
     '@ Symbol Presence': 22,
+    'Punycode/Homograph Domain': 22,
     'DNS Record Validity': 20,
     'Credential Request': 18,
     'SSL/HTTPS Certificate': 15,
@@ -337,10 +417,10 @@ function calculatePhishProbability(features: FeatureData[]): { probability: numb
         high: 0.85,
         critical: 1.0,
       }[feature.severity];
-      
+
       const impact = weight * severityMultiplier;
       phishScore += impact;
-      
+
       shapValues.push({
         feature: feature.name,
         impact: impact,
@@ -350,8 +430,11 @@ function calculatePhishProbability(features: FeatureData[]): { probability: numb
 
   // Normalize to 0-100 range
   let probability = Math.min(95, Math.round((phishScore / 120) * 100));
-  
+
   // Adjust for known legitimate domains
+  // FIX: this now only fires for a *true* match (exact domain or real subdomain),
+  // never for a typosquat or substring look-alike, so it can no longer be abused
+  // to erase a fake site's score.
   const hasLegitDomain = features.find(f => f.name === 'Domain Reputation' && f.value === 'Trusted');
   if (hasLegitDomain) {
     probability = Math.max(0, probability - 40);
