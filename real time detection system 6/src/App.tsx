@@ -52,7 +52,7 @@ export default function App() {
         <div className="container mx-auto px-4 text-center text-sm text-slate-500">
           <p>PhishGuard - Real-Time Phishing Detection System | Research by Abhishek K</p>
           <p className="mt-1">Acharya Institute of Technology, Bengaluru | Dept. of Computer Science & Engineering</p>
-          <P © 2026 PhishGuard. All rights reserved. <P></P>
+          <p className="mt-1 text-xs">&copy; 2026 PhishGuard. All rights reserved.</p>
         </div>
       </footer>
     </div>
