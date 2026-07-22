@@ -50,8 +50,9 @@ export default function App() {
       {/* Footer */}
       <footer className="border-t border-slate-800 py-4 mt-auto">
         <div className="container mx-auto px-4 text-center text-sm text-slate-500">
-          <p>PhishGuard - Real-Time Phishing Detection System | Research by Soniya R, Srikant SP, Abhishek K, Gagan M</p>
+          <p>PhishGuard - Real-Time Phishing Detection System | Research by Abhishek K</p>
           <p className="mt-1">Acharya Institute of Technology, Bengaluru | Dept. of Computer Science & Engineering</p>
+          <P © 2026 PhishGuard. All rights reserved. <P></P>
         </div>
       </footer>
     </div>
